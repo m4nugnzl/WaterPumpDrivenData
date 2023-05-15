@@ -1,0 +1,305 @@
+---
+title: Pump it Up Data Mining the Water Table
+author: Manuel González
+date: "Last Updated: `r format(Sys.time(), '%d, %B, %Y at %H:%M')`"
+output: rmdformats::robobook
+---
+
+```{r setup, include=FALSE}
+# Load libraries
+suppressPackageStartupMessages({
+  library(data.table) # Fast processing.
+  library(tidytable)  # data.table a la dplyr
+  library(ggplot2)    # Graphics
+  library(janitor)    # Clean names
+  library(inspectdf)  # Automatic EDA
+  library(forcats)    # For categorical.
+  library(magrittr)   # For piping
+  library(ranger)     # Fast RF
+  library(missRanger) # Fast imputation with RF
+  library(tictoc)     # Execution times.
+  library(tibble)
+  library(geosphere)
+  library(lubridate)
+  library(kableExtra) # beauty print tables
+  library(skimr)      # beauty descriptives
+  library(doMC)       # model
+  library(Rborist)    # model
+  library(MLmetrics)  # model
+  library(caret)      # model
+  library(RColorBrewer) # color palette
+})
+```
+
+```{r}
+train <- fread("./data/train.csv") %>% as.data.frame()
+test <- fread("./data/test.csv") %>% as.data.frame()
+trainlab <- fread("./data/train_labels.csv") %>% as.data.frame()
+```
+# 1. Exploratory Data Analysis
+```{r}
+paste0('Shape del dataframe: ',dim(train)[1],' filas y ',dim(train)[2],' columnas')
+```
+```{r}
+# Bar plot showing memory usage for each column
+show_plot(inspect_mem(train))
+```
+```{r}
+# Barplot of column types
+show_plot(inspect_types(train))
+```
+
+```{r}
+# Horizontal bar plot for categorical column composition
+show_plot(inspect_cat(train))
+```
+Podemos ver que:
+
+1. Variables como `payment` y `payment_type` o `quantity` y `quantity_group`
+2. La variable `recorded_by` tan sólo tiene una categoría, lo cual no la hace interesante de cara al modelizado
+2. Las variables `wpt_name`, `subvillage`, `ward`,`funder`, `installer` o `date_recorded` tienen mucha cardinalidad
+3. Algunas variables tienen una agrupación de categorías muy similares, dado que pertenecen a un mismo grupo, como las `extraction`.
+```{r}
+# Bar plot of most frequent category for each categorical column
+show_plot(inspect_imb(train))
+```
+```{r}
+skim(train,amount_tsh,construction_year,district_code,gps_height,latitude,longitude,num_private,population,region_code)
+```
+```{r}
+# Histograms for numeric columns
+show_plot(inspect_num(train))
+```
+
+1. La variable `amount_tsh` se distribuye en torno al `0`, aunque existen valores claramente atípicos que sugiere una posible transformación a tipo logarítmico o algún tipo de tratamiento de los datos. Lo mismo ocurre con `num_private` y `population`.
+2. La variable `construction_year` tiene un alto número de *NAs*, aunque no estén catalogados como tal. Podríamos imputarlos y crear una nueva variable que almacene si el dato era *NA* o no. Ocurre igual con la variable `district_code`.
+3. La variable `gps_height` tiene muchos valores en torno al 0. No sabemos si tiene sentido que las bombas están a una baja altura o no.
+4. La variable `longitude` tiene valores atípicos catalogados como 0, que posiblemente sean *NAs*
+
+```{r}
+# Occurence of NAs in each column ranked in descending order
+show_plot(inspect_na(train))
+```
+```{r}
+# Correlation betwee numeric columns + confidence intervals
+show_plot(inspect_cor(train))
+```
+
+# 2. Preprocessing
+
+```{r}
+# put together train and test
+traintest <- train %>% bind_rows(test) %>% as.data.table()
+```
+## 2.1. Selecting categorical variables
+```{r}
+# categorical variables df
+cat <- traintest %>% select(where(is.character))
+# get the cardinality of a category
+levels <- data.frame(
+                          "vars" = names(cat),
+                           "levels" = apply(cat, 2,
+                                  function(x) length(unique(x)))
+
+                        )
+# detele rownames
+rownames(levels) <- NULL
+
+# sort by cardinality
+levels_sorted <- levels %>% arrange(levels)
+
+levels_sorted %>%
+  kbl() %>%
+  kable_minimal()
+```
+Variables con más de `2000` categorías pueden ser a priori contraproducentes a la hora de crear un modelo, por lo que para una primera versión prescindiremos de ellas.
+```{r}
+# select only categories with cardinality > 1 and < 1000
+catvar <- levels %>%
+  filter(levels < 1000, levels > 1) %>%
+  select(vars)
+# new dataframe
+cat <- subset(cat, select = catvar$vars)
+```
+## 2.1. Selecting numerical variables
+```{r}
+# payment_type: categorias muy similares con la variable "payment"
+table(traintest$payment_type)
+```
+```{r}
+table(traintest$payment)
+```
+```{r}
+# quantity_group: mismas categorias que con la variable quantity
+table(traintest$quantity_group)
+```
+```{r}
+# quantity_group: mismas categorias que con la variable quantity
+table(traintest$quantity)
+```
+```{r}
+traintest$payment_type <- NULL
+traintest$quantity_group <- NULL
+```
+```{r}
+# numerical variables
+num <- traintest %>% select(where(is.numeric))
+# logical variables
+logi <- traintest %>% select(where(is.logical))
+```
+```{r}
+# join three dataframes
+traintest <- cbind(num, logi,cat) %>% as.data.frame()
+```
+# 3. Imputation of missings
+
+```{r}
+# Histograms for numeric columns
+show_plot(inspect_num(traintest[,c('construction_year', 'district_code', 'longitude','gps_height')]))
+```
+Como hemos comentado en la primera sección, las variables `construction_year`, `district_code`, `longitude` y `gps_height` tienen valores *missing* catalogados como `0`. Es por ello por lo que los pasaremos a *NA* y posteriormente los imputaremos. Además, crearemos una variable binaria que contabilice aquellos datos que eran *NA*.
+```{r}
+# Funcion para la imputacion de ceros con missRanger
+impute_zeros <- function(data, columns, k, num_trees, impute = TRUE, seed = 0) {
+  #new_feature <- paste0("NA_", column)
+  #data[, new_feature] <- data[, column]
+  # create new variable that says if the value was NA or not
+  # if NA->1 else 0
+  #data[, new_feature] <- ifelse(data[, new_feature] == 0, 1, 0)
+  # turn 0 values to NA values
+  #data[column] <- ifelse(data[, column] == 0,NA,data[, column])
+
+  for (col in columns) {
+    new_col <- paste0("NA_", col)
+    # create new variable that says if the value was NA or not
+    # if NA->1 else 0
+    data[[new_col]] <- ifelse(data[[col]] == 0, 1, 0)
+    data[[col]] <- ifelse(data[[col]] == 0, NA, data[[col]])
+}
+
+  # now we impute values
+  if (impute == TRUE) {
+    data_imp <- missRanger( data,
+                            pmm.k = k,
+                            num.trees = num_trees,
+                            seed = seed,
+                            verbose = 0)
+
+  }
+  return(data_imp)
+}
+```
+```{r}
+traintestimp <- impute_zeros(traintest,
+                             columns = c('construction_year', 'district_code', 'longitude','gps_height'),
+                             k = 5,
+                             num_trees = 100)
+
+# Histograms for numeric columns
+show_plot(inspect_num(traintestimp[,c('construction_year', 'district_code', 'longitude','gps_height')]))
+
+```
+```{r}
+# create idx column to separate
+traintestimp %<>%
+  mutate( idx = 1:nrow(traintestimp)) %>%
+  as.data.table()
+# separate train and test using idx.
+xtrain <- traintestimp %>% as.data.table() %>%
+  filter( idx <= nrow(train)) %>%
+  select(-idx) %>%
+  mutate( status_group = trainlab$status_group) %>% # we add the target
+  as.data.table()
+
+xtest <- traintestimp %>% as.data.table() %>%
+  filter( idx > nrow(train)) %>%
+  select(-idx) %>%
+  as.data.table()
+
+# change status group tu numerical
+#xtrain[, status_group := ifelse(status_group == "functional", 0, ifelse(status_group == "non functional", 1, 2))]
+xtrain %<>% mutate( status_group = as.factor(status_group)) # make it factor
+```
+```{r}
+#ytrain <- xtrain %>% select(status_group) %>% as.data.table()
+#xtrain %<>% select(-status_group) %>% as.data.table()
+```
+
+# 4. Modelization
+
+```{r}
+# we make a random forest function
+fit_random_forest <- function(formula, data, num_trees = 500, mtry = NULL, seed = 0) {
+  tic()
+  my_model <- ranger(
+    formula,
+    importance = 'impurity',
+    data       = data,
+    num.trees = num_trees,
+    mtry = mtry,
+    verbose = FALSE,
+    seed = seed
+  )
+  # "Estimacion" del error / acierto "esperado" (OOB accuracy)
+  success <- 1 - my_model$prediction.error
+  print(success)
+  toc()
+
+  return(my_model)
+}
+
+save_importance_ggplot <- function(model, path, title) {
+  impor_df <- as.data.frame(model$variable.importance)
+  names(impor_df)[1] <- c('Importance')
+  impor_df$vars <- rownames(impor_df)
+  rownames(impor_df) <- NULL
+
+  # color palette
+  colors <- colorRampPalette(brewer.pal(9, "Set1"))(length(impor_df$vars))
+
+  print(
+      ggplot(impor_df, aes(fct_reorder(vars, Importance), Importance, fill = vars)) +
+      geom_col() +
+      coord_flip() +
+      labs(x = 'Variables', y = 'Importancia', title = title) +
+      theme(axis.text.y = element_text(face = "bold", colour = "black")) +
+      scale_fill_manual(values = colors) +
+      guides(fill = 'none')
+    )
+  ggsave(path)
+}
+```
+```{r}
+formula <- as.formula('status_group~.')
+my_model_1 <- fit_random_forest(formula, xtrain)
+```
+## 4.1. Variable Importance
+```{r}
+save_importance_ggplot(my_model_1, "./charts/v1.png",
+                       title = "Importancia Variables Modelo '01' ")
+```
+
+# 5. Submission
+
+```{r}
+# funcion para realizar prediccion sobre el modelo pasado como parametro
+make_predictions <- function(model, test_data) {
+  # Prediccion
+  my_pred <- predict(model, test_data)
+
+  # Submission
+  my_sub <- data.table(
+    id = test_data[, "id"],
+    status_group = my_pred$predictions
+  )
+
+  return(my_sub)
+}
+```
+```{r}
+my_sub_1 <- make_predictions(my_model_1, xtest)
+# guardo submission
+fwrite(my_sub_1, file = "./submissions/01.csv")
+```
+
+![driven data score](./submissions/scores/01.png)
