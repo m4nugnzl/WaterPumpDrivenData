@@ -1,0 +1,1076 @@
+---
+title: Pump it Up Data Mining the Water Table
+author: Manuel González
+date: "Last Updated: `r format(Sys.time(), '%d, %B, %Y at %H:%M')`"
+output:
+  rmdformats::robobook:
+    highlight: default
+---
+
+```{r setup, include=FALSE}
+# Load libraries
+suppressPackageStartupMessages({
+  library(data.table) # Fast processing.
+  library(tidytable)  # data.table a la dplyr
+  library(ggplot2)    # Graphics
+  library(janitor)    # Clean names
+  library(inspectdf)  # Automatic EDA
+  library(forcats)    # For categorical.
+  library(magrittr)   # For piping
+  library(ranger)     # Fast RF
+  library(missRanger) # Fast imputation with RF
+  library(tictoc)     # Execution times.
+  library(tibble)
+  library(geosphere)
+  library(lubridate)
+  library(kableExtra) # beauty print tables
+  library(skimr)      # beauty descriptives
+  library(doMC)       # model
+  library(Rborist)    # model
+  library(MLmetrics)  # model
+  library(caret)      # model
+  library(RColorBrewer) # color palette
+  library(mice)        # imputation
+  library(stringi)
+  library(xgboost)
+  library(caret)
+  library(lightgbm)
+  library(xgboost)
+  library(e1071)
+  library(randomForest)
+  library(nnet)
+  library(gbm)
+  library(lattice)
+  library(smotefamily)
+  library(DMwR)
+  library(DMwR2)
+  library(progress)
+  library(caretEnsemble)
+  library(randomForest)
+  library(nnet)
+  library(fastDummies)
+})
+knitr::opts_chunk$set(eval=FALSE)
+```
+```{css, echo=FALSE}
+ .custom-code-chunk pre { background-color: #D3D3D3; }
+```
+El objetivo es el de predecir la condición de un *waterpoint* para cada registro del conjunto de datos. Tenemos el siguiente conjunto de variables:
+
+* `amount_tsh` - cantidad de agua disponible para el *waterpoint*
+* `date_recorded` - La fecha en que se ingresó el dato
+* `funder` - Quién financió el pozo
+* `gps_height` - Altitud del pozo
+* `installer` - Organización que instaló el pozo
+* `longitude` - Coordenada GPS (longitud)
+* `latitude` - Coordenada GPS (latitud)
+* `wpt_name` - Nombre del *waterpoint* si existe alguno
+* `num_private` -
+* `basin` - Cuenca hidrográfica geográfica
+* `subvillage` - Ubicación geográfica
+* `region` - Ubicación geográfica
+* `region_code` - Ubicación geográfica (codificada)
+* `district_code` - Ubicación geográfica (codificada)
+* `lga` - Ubicación geográfica
+* `ward` - Ubicación geográfica
+* `population` - Población alrededor del pozo
+* `public_meeting` - Verdadero/Falso
+* `recorded_by` - Grupo que ingresa esta fila de datos
+* `scheme_management` - Quién opera el punto de agua
+* `scheme_name` - Nombre del esquema que opera el *waterpoint*
+* `permit` - Si el punto de agua está permitido
+* `construction_year` - Año en que se construyó el *waterpoint*
+* `extraction_type` - Tipo de extracción que utiliza el *waterpoint*
+* `extraction_type_group` - Grupo de tipo de extracción que utiliza el *waterpoint*
+* `extraction_type_class` - Clase de tipo de extracción que utiliza el *waterpoint*
+* `management` - Cómo se gestiona el *waterpoint*
+* `management_group` - Grupo de gestión del *waterpoint*
+* `payment` - Costo del agua
+* `payment_type` - Tipo de pago del agua
+* `water_quality` - Calidad del agua
+* `quality_group` - Grupo de calidad del agua
+* `quantity` - Cantidad de agua
+* `quantity_group` - Grupo de cantidad de agua
+* `source` - Fuente del agua
+* `source_type` - Tipo de fuente del agua
+* `source_class` - Clase de fuente del agua
+* `waterpoint_type` - Tipo de *waterpoint*
+* `waterpoint_type_group` - Grupo de tipo de *waterpoint*
+
+Los ficheros proporcionados son los siguientes:
+
+* `train_values.csv`: fichero con el conjunto de variables y observaciones con los que entrenar el modelo.
+* `train_labels.csv`: fichero con las variables objetivo de cada una de las observaciones en `train_values.csv`:
+  - *functional*
+  - *non functional*
+  - *functional needs repair*
+* `test_values.csv`: fichero de prueba con el que maximizar las predicciones obtenidas con el correspondiente modelo
+
+A lo largo del notebook, comentaré las distintas pruebas que he ido haciendo en el modelo y el cómo estas afectan al score de las predicciones del set de datos test.
+
+# 0. Read the Data
+
+```{r,eval = TRUE}
+train <- fread("./data/train.csv") %>% as.data.frame()
+test <- fread("./data/test.csv") %>% as.data.frame()
+trainlab <- fread("./data/train_labels.csv") %>% as.data.frame()
+
+# put together train and test
+TrainTest <- train %>% bind_rows(test) %>% as.data.table()
+```
+
+# 1. Exploratory Data Analysis
+
+```{r,eval = TRUE}
+paste0('Shape del dataframe: ',dim(train)[1],' filas y ',dim(train)[2],' columnas')
+```
+```{r,eval = TRUE}
+# Bar plot showing memory usage for each column
+show_plot(inspect_mem(train))
+```
+```{r,eval = TRUE}
+# Barplot of column types
+show_plot(inspect_types(train))
+```
+```{r,eval = TRUE}
+# Horizontal bar plot for categorical column composition
+show_plot(inspect_cat(train))
+```
+Podemos ver que:
+
+1. Variables como `payment` y `payment_type` o `quantity` y `quantity_group` son idénticas, dado que tienen las mismas categorías y tienen el mismo volumen de datos por categoría.
+2. La variable `recorded_by` tan sólo tiene una categoría, lo cual no la hace interesante de cara al modelo.
+2. Las variables `wpt_name`, `subvillage`, `ward`,`funder`, `installer` o `date_recorded` tienen mucha cardinalidad
+3. Algunas variables tienen una agrupación de categorías muy similares, dado que pertenecen a un mismo grupo, como las `extraction`.
+```{r,eval = TRUE}
+# Bar plot of most frequent category for each categorical column
+show_plot(inspect_imb(train))
+```
+```{r,eval = TRUE}
+skim(train,amount_tsh,construction_year,district_code,gps_height,latitude,longitude,num_private,population,region_code)
+```
+```{r,eval = TRUE}
+# Histograms for numeric columns
+show_plot(inspect_num(train))
+```
+
+1. La variable `amount_tsh` se distribuye en torno al `0`, aunque existen valores claramente atípicos que sugiere una posible transformación a tipo logarítmico o algún tipo de tratamiento de los datos. Lo mismo ocurre con `num_private` y `population`.
+2. La variable `construction_year` tiene un alto número de *NAs*, aunque no estén catalogados como tal. Podríamos imputarlos y crear una nueva variable que almacene si el dato era *NA* o no. Ocurre igual con la variable `district_code`.
+3. La variable `gps_height` tiene muchos valores en torno al 0. No sabemos si tiene sentido que las bombas están a una baja altura o no.
+4. La variable `longitude` tiene valores atípicos catalogados como 0, que posiblemente sean *NAs*
+
+```{r,eval = TRUE}
+# Occurence of NAs in each column ranked in descending order
+show_plot(inspect_na(train))
+```
+```{r,eval = TRUE}
+# Correlation betwee numeric columns + confidence intervals
+show_plot(inspect_cor(train))
+```
+
+# 2. Preprocessing
+
+## 2.1. Selecting categorical variables
+```{r,eval = TRUE}
+# categorical variables df
+cat <- TrainTest %>% select(where(is.character))
+# get the cardinality of a category
+levels <- data.frame("vars" = names(cat),
+                     "levels" = apply(cat, 2,
+                     function(x) length(unique(x))) )
+# detele rownames
+rownames(levels) <- NULL
+
+# sort by cardinality
+levels_sorted <- levels %>% arrange(levels)
+
+levels_sorted %>% kbl() %>% kable_minimal()
+```
+Variables con más de `3000` categorías pueden ser a priori contraproducentes a la hora de crear un modelo, por lo que a priori prescindiremos de ellas.
+```{r,eval = TRUE}
+# select only categories with cardinality > 1 and < 2200
+catvar <- levels %>%
+  filter(levels < 3000, levels > 1) %>%
+  select(vars)
+# new dataframe
+cat <- subset(cat, select = catvar$vars)
+```
+Nos quedamos también con las variables con pocas categorías para posteriormente hacer *dummies*
+```{r}
+# select only categories with cardinality > 1 and < 2200
+dum <- levels %>%
+  filter(levels < 20, levels > 1) %>%
+  select(vars)
+# new dataframe
+dummies <- subset(cat, select = dum$vars)
+```
+
+## 2.2. Selecting numerical variables
+
+Una vez elegidas las variables categóricas, nos quedamos con las numéricas y las lógicas para hacer un nuevo dataset con dichas variables.
+```{r,eval = TRUE}
+# numerical variables
+num <- TrainTest %>% select(where(is.numeric))
+# logical variables
+logi <- TrainTest %>% select(where(is.logical))
+```
+```{r,eval = TRUE}
+# join three dataframes
+traintest <- cbind(num, logi,cat) %>% as.data.table()
+traintest <- traintest %>% mutate(across(where(is.logical), ~ as.numeric(.x)))
+```
+Una vez tenemos creado el dataset,fijémonos en algunas de las variables:
+```{r,eval = TRUE}
+table(traintest$payment_type)
+```
+```{r,eval = TRUE}
+table(traintest$payment)
+```
+```{r,eval = TRUE}
+# quantity_group: mismas categorias que con la variable quantity
+table(traintest$quantity_group)
+```
+```{r,eval = TRUE}
+# quantity_group: mismas categorias que con la variable quantity
+table(traintest$quantity)
+```
+Eliminamos por tanto las variables y los datos duplicados, ya que no aportan información al modelo. Eliminamos también la variable `installer`, ya que no conseguimos sacarle partido en el modelo.
+```{r,eval = TRUE}
+print_duplicates <- function(data) {
+  duplicated_rows <- duplicated(data)
+  duplicated_data <- data[duplicated_rows, ]
+  duplicated_data %<>% as.data.frame()
+  print(dim(duplicated_data)[1])
+}
+
+# duplicated rows
+print_duplicates(traintest)
+```
+no tenemos valores duplicados
+```{r,eval = TRUE}
+traintest <- traintest %>%
+             select(-quantity_group) %>%
+             select(-payment_type) %>%
+             select(-installer)
+```
+
+## 2.3. Data Imputation
+Como hemos comentado en la primera sección, las variables `construction_year`, `district_code`, `longitude` y `gps_height` tienen valores *missing* catalogados como `0`. En una primera aproximación, hemos probado a pasar a `NA` y posteriormente imputarlos,creando además una variable binaria que contabilice los datos que eran `NA`:
+
+```{r,eval = FALSE}
+# Function to impute zeros using missRanger method
+impute <- function(data, columns, k, num_trees, impute = TRUE, seed = 0) {
+  for (col in columns) {
+    new_col <- paste0("NA_", col)
+    # create new variable that says if the value was NA or not
+    # if NA` -`> 1 ; else -> 0
+    data[[new_col]] <- ifelse(data[[col]] == 0, 1, 0)
+    data[[col]] <- ifelse(data[[col]] == 0, NA, data[[col]])
+  }
+
+  # now we impute values
+  if (impute == TRUE) {
+    data <- data %>%
+            # create variables that tell us if the row was NA or not
+            mutate(NA_public_meeting = ifelse(is.na(public_meeting),0,1)) %>%
+            mutate(NA_permit = ifelse(is.na(permit),0,1))
+    data_imp <- missRanger(data,
+                           pmm.k = 5,
+                           seed = 0,
+                           maxiter = 100)
+    #data_imp <- kNN(data)#,k = floor(sqrt(dim(data)[1])))
+
+  }
+  return(data_imp)
+}
+```
+
+Pero la realidad es que el hecho de añadir las variables binarias al dataset no mejora en absoluto el *score* del modelo. Las únicas variables binarias que sí mejoran el rendimiento del modelo son las de `public_meeting` y `permit`, por lo que optamos por eliminar aquellas que empeoran el score. También he probado distintos métodos de imputación de datos, como el `MICE` y `KNN`:
+
+```{r,eval = FALSE}
+# Function to impute zeros using KNN method
+impute <- function(data, columns, k, num_trees, impute = TRUE, seed = 0) {
+  # now we impute values
+  if (impute == TRUE) {
+    data <- data %>%
+            # create variables that tell us if the row was NA or not
+            mutate(NA_public_meeting = ifelse(is.na(public_meeting),0,1)) %>%
+            mutate(NA_permit = ifelse(is.na(permit),0,1))
+    data_imp <- kNN(data)#,k = floor(sqrt(dim(data)[1])))
+
+  }
+  return(data_imp)
+}
+```
+
+```{r,eval = FALSE}
+# Function to impute zeros using MICE method
+impute <- function(data, columns, k, num_trees, impute = TRUE, seed = 0) {
+  # now we impute values
+  if (impute == TRUE) {
+    data <- data %>%
+            # create variables that tell us if the row was NA or not
+            mutate(NA_public_meeting = ifelse(is.na(public_meeting),0,1)) %>%
+            mutate(NA_permit = ifelse(is.na(permit),0,1))
+    data_imp <- mice(data, m = 20, method = "pmm", seed = 0)
+    data_imp <- complete(data_imp)
+  }
+  return(data_imp)
+}
+```
+
+
+Pero ninguna de ellas mejora el score del modelo, por lo que optamos por el método `missRanger` visto en clase.
+```{r cache=TRUE, results='hide',eval = TRUE}
+# Funcion para la imputacion de ceros con missRanger
+impute <- function(data, columns, k, num_trees, impute = TRUE, seed = 0) {
+  # now we impute values
+  if (impute == TRUE) {
+    data <- data %>%
+            # create variables that tell us if the row was NA or not
+            mutate(NA_public_meeting = ifelse(is.na(public_meeting),0,1)) %>%
+            mutate(NA_permit = ifelse(is.na(permit),0,1))
+    data_imp <- missRanger(data,
+                           pmm.k = 5,
+                           seed = 0,
+                           maxiter = 100)
+  }
+  return(data_imp)
+}
+
+# impute data
+traintestimp <- impute(traintest,
+                             columns = c('construction_year', 'district_code', 'longitude','gps_height'),
+                             k = 5,
+                             num_trees = 100)
+```
+## 2.4. Feature Engineering
+
+Vamos con la sección más importante de todas, la creación de nuevas variables que sean capaces de mostrar información que anteriormente parecía oculta para el modelo. Para gran parte de la creación de variables he recurrido a otros códigos de internet, buscando aquellas variables que sirviesen para aumentar el score del modelo. En resumidas cuentas, lo que hacemos:
+
+* Las variables con muchas categorías, como lo son `ward`, `funder` y `scheme_name` tienen elementos, como paréntesis barras o signos de puntuación que hace que palabras iguales se cataloguen como distintas categorías. Por tanto, en primer lugar limpiamos el texto, y posteriormente hacemos lumping de igual que hemos hecho en clase.
+* `fe_popnum_ward`: cantidad de poblacion por bomba de agua
+* `fe_dist`: unifica las variables longitud y latitud (que son muy importantes para el modelo) en una nueva variable que codifique la distancia con respecto a un origen de coordenadas.
+* `fe_cant_agua`: describe la cantidad de agua por población.
+* `fe_age`: antigüedad de bomba de agua.
+* `fe_days`: similar a `fe_age` pero con respecto a `date_recorded`.
+* `fe_drdiff`:año en el que se registró frente al que se construyó.
+
+```{r,eval = TRUE}
+# cleanning some garbage present in ward and funder to reduce categories
+clean_text <- function(text) {
+  stri_trans_tolower(
+    stri_replace_all_regex(
+      text,
+      pattern = "[ +\\p{Punct}()]",
+      replacement = "")
+    )
+}
+
+traintestimp <- traintestimp %>%
+        #population por bomb number * ward
+        #mutate(fe_popnum_ward = (sum(population) / n.()), .by = ward ) %>%
+        mutate(ward = clean_text(ward)) %>%
+        mutate(funder = clean_text(funder)) %>%
+        mutate(scheme_name = clean_text(scheme_name)) %>%
+        mutate(ward = as.character(fct_lump(ward, n = 200))) %>%
+        mutate(funder = as.character(fct_lump(funder, n = 200))) %>%
+        mutate(scheme_name = as.character(fct_lump(scheme_name, n = 200))) %>%
+        #geographic distance
+        mutate(fe_dist = distGeo(as.matrix(cbind(longitude, latitude)), c(0, 0))) %>%
+        # amount of water per population
+        mutate(fe_cant_agua = ifelse(population == 0, 0, round(amount_tsh / population, 3))) %>%
+        # age of the water pump
+        mutate(fe_age = 2014 - construction_year) %>%
+        mutate(fe_days = as.numeric(as.Date("2014-01-01") - as.Date(TrainTest$date_recorded))) %>%
+        # get the year and the month
+        mutate(fe_dryear = year(TrainTest$date_recorded)) %>%
+        mutate(fe_drmonth = month(TrainTest$date_recorded)) %>%
+        # difference between recorded date and construction date
+        mutate(fe_drdiff = fe_dryear-construction_year) %>%
+        as.data.table()
+```
+Lo siguiente que hacemos es crear nuevas variables que expresen la frecuencia de las categorías para el caso de las variables categóricas.
+```{r,eval = TRUE}
+cat_cols <- names(traintestimp %>% select(where(is.character)))
+cat_cols
+```
+```{r,eval = TRUE}
+for (cat_col in cat_cols) {
+  # calculate for every value and then convert it to numeric
+  traintestimp[, paste0("fe_", cat_col) := as.numeric(.N), by = cat_col] }
+# delete old cat cols
+for (cat_col in cat_cols) {
+  traintestimp[, paste(cat_col) := NULL] }
+```
+Con las variables de menos de 20 categorías, he probado a hacer *dummies* y crear modelos, pero el *score* de los mismos empeora con respecto a aquellos que no tienen las variables *dummies*.
+
+```{r,eval = FALSE}
+datos_dummy <- dummy_cols(dummies) %>% select(where(is.numeric))
+traintestimp <- cbind(traintestimp, datos_dummy)
+```
+
+```{r,eval = TRUE}
+numeric_vars <- names(traintestimp %>%  select(where(is.numeric)))
+length(numeric_vars)
+```
+Como sabemos, algunos modelos son sensibles al escalado de los datos, por lo que una buena idea podría ser la de escalar los datos previo a ajustarlos a los distintos modelos.
+
+```{r,eval = FALSE}
+# Función para estandarizar las variables
+standardize <- function(x) {
+  (x - mean(x)) / sd(x) }
+
+# Escalar las variables numéricas
+traintestimp[, (numeric_vars) := lapply(.SD, standardize), .SDcols = numeric_vars]
+```
+
+Sin embargo, esto no mejora en absoluto el rendimiento del modelo, por lo que optamos por prescindir de ello.
+
+Hemos probado también a prescindir de ciertas variables que tenían poca importancia en los modelos de tipo *random forest*, de forma que de más importancia absoluta a otras variables que puedan tener más relevancia real y el score del modelo aumente, pero el hecho de eliminarlas no mejora el score real, por lo que optamos por dejarlas.
+
+```{r,eval = FALSE}
+traintestimp %<>% select(-num_private) %>%
+                  select(-NA_permit) %>%
+                  select(-NA_public_meeting)  %>%
+                  select(-fe_dryear)
+```
+
+Con todo esto, procedemos a dividir de nuevo el conjunto en *train* y *test* para posteriormente crear y ajustar los modelos. Para ello, creamos la columna `idx`.
+
+```{r,eval = TRUE}
+# create idx column to separate
+traintestimp %<>%
+  mutate( idx = 1:nrow(traintestimp)) %>%
+  as.data.table()
+# separate train and test using idx.
+xtrain <- traintestimp %>% as.data.table() %>%
+  filter( idx <= nrow(train)) %>%
+  select(-idx) %>%
+  #mutate( status_group = trainlab$status_group) %>% # we add the target
+  as.data.table()
+
+xtest <- traintestimp %>% as.data.table() %>%
+  filter( idx > nrow(train)) %>%
+  select(-idx) %>%
+  as.data.table()
+```
+Pasamos la variable objetivo `vector_status_group` a numérico y posteriormente a factor, para poder realizar modelos como el *XGBoost* o el *lightGBM*. Definimos la fórmula con la que haremos los modelos.
+```{r,eval = TRUE}
+vector_status_group <- trainlab$status_group
+vector_status_group <- ifelse(vector_status_group == "functional", 0,
+                              ifelse(vector_status_group == "functional needs repair", 1,
+                              2))
+
+vector_status_group <- as.factor(vector_status_group)
+x_train <- xtrain %>% mutate(vector_status_group=vector_status_group) %>%   as.data.frame()
+x_test <- as.data.frame(xtest)
+
+formula <- as.formula(vector_status_group ~ .)
+```
+
+Podemos ver la clara desproporción de la variable objetivo, que tiene muy pocas muestras de la `clase 1`. Ello hace que el modelo, que ha sido entrenado con dichos datos, no sea capaz de captar la información y, por tanto, a la hora de predecir tienda a fallar en dicha clase. Por ello, es posible que la implementación de `SMOTE`para balancear las clases mejore el rendimiento del modelo.
+
+```{r,eval = TRUE}
+table(vector_status_group)
+# completely unbalanced in class 1
+```
+
+```{r,eval = TRUE}
+# Apply SMOTE
+set.seed(0)
+
+data <- x_train %>% mutate(vector_status_group = as.factor(vector_status_group))
+
+# to increase the number of samples of the minoritary class
+smote_data <- SMOTE(vector_status_group ~ ., data)#, perc.over = 100,perc.under = 500)
+
+# Verify if smote worked correctly
+table(smote_data$vector_status_group)
+```
+
+Pero la realidad es que el hecho de aplicar `SMOTE` no solo no mejora el rendimiento si no que lo empeora, por lo que prescindimos de ello.
+
+# 3. Modelization
+
+## 3.1. Model Selection
+
+Una vez preprocesados los datos, realizamos un estudio mediante *cross-validation* para decidir cuál es el mejor modelo con el que ajustar a nuestros datos.
+```{r cache=TRUE,eval = TRUE,results = 'hide'}
+# Definir los parámetros
+num_trees <- 100  # Número de árboles en el bosque
+mtry <- 3  # Número de variables predictoras seleccionadas en cada división
+n_folds <- 5  # Número de folds en la validación cruzada
+
+# Crear un contenedor para almacenar los resultados de cada fold
+accuracy_results <- numeric(n_folds)
+
+# Realizar la validación cruzada
+set.seed(42)  # Fijar la semilla para reproducibilidad
+
+#x_train <- xtrain %>% mutate(vector_status_group=vector_status_group) %>%   as.data.frame()
+# Obtener los índices de los folds
+folds <- cut(seq(1, nrow(x_train)), breaks = n_folds, labels = FALSE)
+
+
+rf_accuracy <- numeric(n_folds)
+logistic_accuracy <- numeric(n_folds)
+xgb_accuracy <- numeric(n_folds)
+lgb_accuracy <- numeric(n_folds)
+svm_accuracy <- numeric(n_folds)
+
+# Iterar sobre cada fold
+for (i in 1:n_folds) {
+  # Dividir los datos en conjuntos de entrenamiento y prueba según el fold actual
+  train_data <- x_train[folds != i, ]
+  test_data <- x_train[folds == i, ]
+
+  vector_train <- train_data %>% select(vector_status_group) %>% pull()
+  train_matrix <- train_data %>% select(-vector_status_group) %>% as.matrix()
+
+  vector_test <- test_data %>% select(vector_status_group) %>% pull()
+  test_matrix <- test_data %>% select(-vector_status_group) %>% as.matrix()
+
+
+  params <- list(
+  objective = "multiclass",
+  num_class = 3,
+  boosting_type = "gbdt",
+  metric = "multi_logloss")
+  # learning_rate = 0.02,
+  # max_depth = 15,
+  # num_threads = 4)
+  # Convertir los datos en formato xgb.DMatrix
+  lgb_train <- lgb.Dataset(data = train_matrix, label = as.numeric(vector_train) - 1)
+  lgb_test <- lgb.Dataset(data = test_matrix, label = as.numeric(vector_test) - 1)
+  # Ajustar el modelo de lightgbm en el conjunto de entrenamiento
+  capture.output({ lgbm <- lgb.train(data = lgb_train, nrounds = 600, valids = list(test = lgb_test), early_stopping_rounds = 10, params = params) }, file = NULL) #params = params,)
+  pred_lgb <- predict(lgbm, test_matrix)
+  pred_lgb_class <- max.col(matrix(pred_lgb, ncol = 3, byrow = TRUE)) - 1
+  lgb_accuracy[i] <- sum(pred_lgb_class == as.numeric(vector_test) - 1) / length(pred_lgb_class)
+
+  # Ajustar el modelo de Random Forest en el conjunto de entrenamiento
+  rf <- ranger(formula, importance = 'impurity', data = train_data, num.trees = num_trees, mtry = mtry, verbose = FALSE, seed = 42, probability = TRUE)
+  predrf <- predict(rf, data = test_data)$predictions
+  rf_accuracy[i] <- sum(max.col(predrf) == as.numeric(test_data$vector_status_group)) / length(test_data$vector_status_group)
+
+  # Ajustar el modelo de regresión logística multinomial en el conjunto de entrenamiento
+  glm <- suppressMessages(multinom(formula, data = train_data, MaxNWts = 10000, MaxIter = 100))
+  predglm <- predict(glm, newdata = test_data, type = "class")
+  logistic_accuracy[i] <- sum(predglm == test_data$vector_status_group) / length(test_data$vector_status_group)
+
+  # Ajustar el modelo de xgboost en el conjunto de entrenamiento
+  params <- list(
+    objective = "multi:softmax",
+    num_class = 3,
+    eval_metric = "mlogloss")
+
+  # Entrenar el modelo XGBoost
+  xgb_train <- xgb.DMatrix(data = train_matrix, label = as.numeric(vector_train) - 1)
+  xgb_test <- xgb.DMatrix(data = test_matrix, label = as.numeric(vector_test) - 1)
+
+  xgb_model <- xgb.train(params = params, data = xgb_train, nrounds = 600, nthread = 4)
+  predxgb <- predict(xgb_model, xgb_test)
+  xgb_accuracy[i] <- sum(predxgb == as.numeric(vector_test) - 1) / length(predxgb)
+
+  # Ajustar el modelo de svm en el conjunto de entrenamiento
+  train_data_svm <- data.frame(train_matrix, y = as.factor(as.numeric(vector_train) - 1))
+  test_data_svm <- data.frame(test_matrix, y = as.factor(as.numeric(vector_test) - 1))
+  svm_model <- svm(y ~ ., data = train_data_svm, method = "svmRadial", kernel = "radial", cost = 10, scale = TRUE)
+  pred_svm <- predict(svm_model, test_data_svm)
+  svm_accuracy[i] <- sum(pred_svm == as.numeric(vector_test) - 1) / length(pred_svm)
+}
+```
+## 3.2. Cross-Validation Accuracy per Model
+```{r,echo=FALSE,eval=TRUE}
+# Ajustar el tamaño de la imagen
+options(repr.plot.width = 10, repr.plot.height = 6)
+
+# Crear un dataframe con los resultados
+results_df <- data.frame(Model = c(rep("RandomForest", n_folds),
+                                   rep("XGBoost", n_folds),
+                                   rep("Lightgbm", n_folds),
+                                   rep("LogReg", n_folds),
+                                   rep("SVMrad", n_folds)),
+                                      # rforest   # xgboost    # lightgbm   #gradientbm  #   logistic     # svmradial
+                         Accuracy = c(rf_accuracy,xgb_accuracy,lgb_accuracy,logistic_accuracy,svm_accuracy))
+# Calcular el valor medio de precisión por modelo
+results_summary <- aggregate(Accuracy ~ Model, data = results_df, FUN = mean)
+
+# Ordenar el dataframe por el valor medio de precisión de menor a mayor
+results_summary <- arrange(results_summary, Accuracy)
+
+# Obtener los modelos ordenados
+model_order <- results_summary$Model
+
+# Reordenar el dataframe results_df utilizando los modelos ordenados
+results_df <- results_df[results_df$Model %in% model_order, ]
+
+# Definir los colores para cada modelo
+model_colors <- c("#E41A1C", "#377EB8", "#4DAF4A", "#984EA3", "#FF7F00")
+
+# Graficar un boxplot de los resultados por modelo sin leyenda
+ggplot(results_df, aes(x = reorder(Model, Accuracy, FUN = mean), y = Accuracy, fill = Model)) +
+  geom_boxplot(width = 0.6, outlier.shape = NA) +
+  labs(x = "Model", y = "Accuracy") +
+  ggtitle("Cross-Validation Accuracy per Model") +
+  scale_fill_manual(values = model_colors) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    axis.text = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    legend.position = "none",  # Eliminar la leyenda
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA),
+    panel.background = element_rect(fill = "white"),
+    plot.margin = unit(c(1, 1, 3, 1), "lines")  # Ajustar los márgenes del gráfico verticalmente
+  )
+```
+Sin muchas dudas, el mejor modelo parece ser el *XGBoost*, ya que es el que menor desviación tiene entre *folds* con el *cross-validation* y es el que mayor valor medio de *accuracy* tiene.
+
+Aún siendo el *XGBoost* el mejor modelo, tuneamos además un *random forest* y creamos predicciones para ver cómo se desenvuelve y cuáles son las variables más importantes.
+
+## 3.2. Random Forest Parameter Tunning
+
+```{r,eval=FALSE}
+# Define the parameter grid to explore
+grid <- expand.grid(
+  mtry = c(6,7,8),                 # Values for the number of predictor variables considered at each split
+  min.node.size = c(4, 5, 6),        # Values for the minimum node size
+  splitrule = c("gini") # Values for the splitting rule
+)
+
+# Define the control function for hyperparameter search
+ctrl <- trainControl(
+  method = "cv",    # Use cross-validation
+  number = 5,       # Number of cross-validation folds
+  search = "grid"   # Perform grid search on the defined parameter grid
+)
+
+# Perform the hyperparameter search and train the model
+rf_model <- train(
+  formula,
+  data = x_train,
+  method = "ranger",
+  trControl = ctrl,
+  tuneGrid = grid
+)
+
+# Show the best selected parameters
+print(rf_model$bestTune)
+```
+
+una vez encontrados los mejores parámetros, creamos el modelo y vemos el efecto de los parámetros en el *score* real de *drivendata*
+
+### 3.2.1. num_trees effect in drivendata accuracy
+
+```{r,echo=FALSE,eval=TRUE}
+# Ajustar el tamaño de la imagen
+options(repr.plot.width = 10, repr.plot.height = 6)
+
+# Crear el dataframe
+gg <- data.frame(
+  mtry = c(300,500,600,700,900),
+  accuracy = c(0.8231,0.8232, 0.8238, 0.8236,0.8232)
+)
+
+# Definir el tamaño de los recuadros
+rect_width <- 75
+rect_height <- 0.00006
+
+# Definir la elevación del recuadro y el texto
+elevation <- 0.000045
+text_elevation <- rect_height + elevation + 0.0001
+
+# Graficar el valor de accuracy para cada valor de mtry
+ggplot(gg, aes(x = mtry, y = accuracy)) +
+  geom_line(color = "#377EB8", linewidth = 1.5) +
+  geom_point(color = "#377EB8", size = 3) +
+  geom_rect(data = gg, aes(xmin = mtry - rect_width/2, xmax = mtry + rect_width/2, ymin = accuracy + elevation, ymax = accuracy + rect_height + elevation),
+            fill = NA, color = "#377EB8", size = 0.5) +
+  geom_text(data = gg, aes(label = round(accuracy, 4)), vjust = -2.2 + text_elevation, size = 4, fontface = "bold", color = "#377EB8") +
+  labs(x = "num_trees", y = "Accuracy") +
+  ggtitle("Drivendata Accuracy (mtry = 5)") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 12),
+    panel.border = element_blank(),
+    panel.grid.major = element_line(color = "lightgray", linetype = "dashed"),
+    panel.grid.minor = element_blank(),
+    plot.margin = unit(c(1, 1, 1, 1), "cm")
+  )
+```
+
+### 3.2.2. mtry effect in drivendata accuracy
+
+```{r,echo=FALSE,eval=TRUE}
+# Ajustar el tamaño de la imagen
+options(repr.plot.width = 10, repr.plot.height = 6)
+
+# Crear el dataframe
+df <- data.frame(
+  mtry = c(5,6, 7, 8),
+  accuracy = c(0.8232,0.8240, 0.8241, 0.8222)
+)
+
+# Definir el tamaño de los recuadros
+rect_width <- 0.3
+rect_height <- 0.00017
+
+# Definir la elevación del recuadro y el texto
+elevation <- 0.00012
+text_elevation <- rect_height + elevation + 0.0001
+
+# Graficar el valor de accuracy para cada valor de mtry
+ggplot(df, aes(x = mtry, y = accuracy)) +
+  geom_line(color = "#377EB8", linewidth = 1.5) +
+  geom_point(color = "#377EB8", size = 3) +
+  geom_rect(data = df, aes(xmin = mtry - rect_width/2, xmax = mtry + rect_width/2, ymin = accuracy + elevation, ymax = accuracy + rect_height + elevation),
+            fill = NA, color = "#377EB8", size = 0.5) +
+  geom_text(data = df, aes(label = round(accuracy, 4)), vjust = -2.2 + text_elevation, fontface = "bold", color = "#377EB8") +
+  labs(x = "mtry", y = "Accuracy") +
+  ggtitle("Drivendata Accuracy (n_trees = 500)") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 12),
+    panel.border = element_blank(),
+    panel.grid.major = element_line(color = "lightgray", linetype = "dashed"),
+    panel.grid.minor = element_blank(),
+    plot.margin = unit(c(1, 1, 1, 1), "cm")
+  )
+```
+
+Con todo ello creamos el modelo y realizamos las predicciones.
+
+```{r cache=TRUE,eval = TRUE}
+# Train the final model with the best selected parameters
+final_rf <- ranger(
+  formula,
+  importance = 'impurity',
+  data = x_train,
+  num.trees = 500, # Specify the number of trees directly here
+  mtry = 7,
+  min.node.size = 5,
+  splitrule = 'gini',
+  verbose = FALSE,
+  seed = 42,
+  probability = FALSE)
+
+# predict test values
+predi_rf <- predict(final_rf, x_test)
+# change predicction from numeric to the categorical values
+predi_rf <- ifelse(predi_rf$predictions == 0, "functional", ifelse(predi_rf$predictions == 1,"functional needs repair","non functional"))
+
+# submit predictions
+predi_rf <- data.table(id = test$id, status_group = predi_rf)
+fwrite(predi_rf, file = "./submissions/subrf")
+```
+
+Obtenemos una puntuación máxima de `0.8241` con el tuneado del *random forest*.
+
+### 3.2.3. Variable Importance
+
+Por curiosidad, y en busca de obtener posible información, graficamos la importancia de las variables del modelo *random forest*, el cual es comúnmente usado como método de selección de variables importantes.
+
+```{r,echo=FALSE,eval=TRUE}
+# Ajustar el tamaño de la imagen
+options(repr.plot.width = 10, repr.plot.height = 6)
+
+library(scales)
+library(forcats)
+
+importance_df <- as.data.frame(final_rf$variable.importance)
+names(importance_df)[1] <- "Importance"
+importance_df$vars <- rownames(importance_df)
+rownames(importance_df) <- NULL
+
+# Ordenar las variables por importancia de mayor a menor
+importance_df$vars <- fct_reorder(importance_df$vars, desc(importance_df$Importance))
+
+# Paleta de colores
+colors <- rep(brewer.pal(n = 9, name = "Blues"), length.out = nrow(importance_df))
+
+# Gráfico de barras horizontales
+ggplot(importance_df, aes(x = Importance, y = vars, fill = vars)) +
+  geom_col() +
+  coord_flip() +
+  labs(x = "Importance", y = "Variables", title = 'Importancia Variables Modelo random forest') +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    axis.text = element_text(size = 12, face = "bold", color = "black"),
+    axis.title = element_text(size = 14, face = "bold"),
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1) # Rotar los nombres de las variables en el eje x
+  ) +
+  scale_fill_manual(values = colors) +
+  guides(fill = "none")
+```
+
+## 3.3. XGBoost Parameter Tunning
+
+De igual forma, creamos y tuneamos un modelo `XGBoost`. En primer lugar, convertimos los datos para poder trabajar con ellos.
+
+```{r,eval = TRUE}
+train_matrix <- x_train %>% select(-vector_status_group) %>%  as.matrix()
+test_matrix <- xtest %>% as.matrix()
+
+# Convert the data to DMatrix format
+dtrain <- xgb.DMatrix(data = train_matrix, label = as.numeric(vector_status_group) - 1)
+dtest <- xgb.DMatrix(data = test_matrix)
+```
+hacemos el tuneado utilizando validación cruzada, de igual manera que en el *random forest*.
+```{r,eval=FALSE}
+pb <- progress_bar$new(total = nrow(params_grid), format = "[:bar] :percent ETA: :eta")
+
+# Define the hyperparameters for the grid search
+params_grid <- expand.grid(
+  max_depth = c(6, 8, 10),
+  eta = c(0.01, 0.1),
+  gamma = c(0, 1),
+  colsample_bytree = c(0.5, 0.75, 1),
+  min_child_weight = c(1, 5),
+  subsample = c(0.5, 0.8),
+  objective = "multi:softprob",
+  num_class = length(unique(vector_status_group)) )
+
+
+best_acc <- 0
+best_params <- list()
+
+pb <- progress_bar$new(total = nrow(params_grid), format = "[:bar] :percent ETA: :eta")
+
+for (i in 1:nrow(params_grid)) {
+  params <- list(
+    max_depth = params_grid$max_depth[i],
+    eta = params_grid$eta[i],
+    gamma = params_grid$gamma[i],
+    colsample_bytree = params_grid$colsample_bytree[i],
+    min_child_weight = params_grid$min_child_weight[i],
+    subsample = params_grid$subsample[i],
+    objective = "multi:softprob",
+    num_class = length(unique(vector_status_group))
+  )
+  # Perform grid search for hyperparameter tuning
+  xgb_model <- xgb.cv(
+    params = params,
+    data = dtrain,
+    nfold = 5,
+    nrounds = 200,
+    early_stopping_rounds = 20,
+    verbose = 0
+  )
+
+   if (1 - tail(xgb_model$evaluation_log$test_mlogloss_mean, 1) > best_acc) {
+    best_acc <- 1 - tail(xgb_model$evaluation_log$test_mlogloss_mean, 1)
+    best_params <- params
+  }
+  # progress bar to show the %
+  pb$tick()
+}
+
+print(best_params)
+```
+
+de forma similar a lo que hemos hecho antes, creamos el modelo y vemos el efecto del parámetro `rounds` en el *score* real de *drivendata*, ya que es el que más influye en el *overfitting* y el que más influye en el tiempo de ejecución, por lo que no lo he usado como parámetro de entrada en el *tunning*
+
+### 3.3.1. rounds effect in drivendata accuracy
+
+```{r,echo=FALSE,eval=TRUE}
+# Ajustar el tamaño de la imagen
+options(repr.plot.width = 10, repr.plot.height = 6)
+
+# Crear el dataframe
+pdp <- data.frame(
+  mtry = c(400, 500, 600, 650, 700),
+  accuracy = c(0.8248,0.8253, 0.8262, 0.8260 , 0.8251)
+)
+
+# Definir el tamaño de los recuadros
+rect_width <- 35
+rect_height <- 0.00012
+
+# Definir la elevación del recuadro y el texto
+elevation <- 0.000062
+text_elevation <- rect_height + elevation + 0.0001
+
+# Graficar el valor de accuracy para cada valor de mtry
+ggplot(pdp, aes(x = mtry, y = accuracy)) +
+  geom_line(color = "#377EB8", linewidth = 1.5) +
+  geom_point(color = "#377EB8", size = 3) +
+  geom_rect(data = pdp, aes(xmin = mtry - rect_width/2, xmax = mtry + rect_width/2, ymin = accuracy + elevation, ymax = accuracy + rect_height + elevation),
+            fill = NA, color = "#377EB8", size = 0.5) +
+  geom_text(data = pdp, aes(label = round(accuracy, 4)), vjust = -1.8 + text_elevation, size = 4, fontface = "bold", color = "#377EB8") +
+  labs(x = "rounds", y = "Accuracy") +
+  ggtitle("Drivendata Accuracy (max_depth = 15)") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 12),
+    panel.border = element_blank(),
+    panel.grid.major = element_line(color = "lightgray", linetype = "dashed"),
+    panel.grid.minor = element_blank(),
+    plot.margin = unit(c(1, 1, 1, 1), "cm")
+  )
+```
+
+una vez tenemos las parámetros ajustados, creamos el modelo y las predicciones
+
+```{r cache=TRUE,results = 'hide',eval=TRUE}
+params <- list(
+    max_depth = 15,
+    eta = 0.02,
+    gamma = 0,
+    colsample_bytree  = 0.3,
+    colsample_bylevel = 0.9,
+    colsample_bynode  = 0.7,
+    min_child_weight = 1,
+    subsample = 0.8,
+    objective = "multi:softmax",
+    num_class = 3)
+
+final_xgb <- xgboost(
+  params = params,
+  data = dtrain,
+  nrounds = 600,
+  verbose = 0)
+
+
+# Make predictions on the test dataset
+predi_xgb <- predict(final_xgb,dtest)
+predi_xgb <- ifelse(predi_xgb == 0, "functional", ifelse(predi_xgb == 1, "functional needs repair", "non functional"))
+
+# Submit predictions
+predi_xgb <- data.table(id = test$id, status_group = predi_xgb)
+fwrite(predi_xgb, file = "./submissions/subxgb")
+```
+obtenemos la que hasta el momento es la mejor *score*.
+
+### 3.3.2. Variable Importance
+
+```{r,echo=FALSE,eval=TRUE}
+# Ajustar el tamaño de la imagen
+options(repr.plot.width = 10, repr.plot.height = 6)
+
+library(scales)
+library(forcats)
+
+importance_df <- as.data.frame(xgb.importance(model = final_xgb))
+importance_df$vars <- rownames(importance_df)
+rownames(importance_df) <- NULL
+
+# Ordenar las variables por importancia de mayor a menor
+importance_df$Feature <- fct_reorder(importance_df$Feature, desc(importance_df$Gain))
+
+# Paleta de colores
+colors <- rep(brewer.pal(n = 9, name = "Blues"), length.out = nrow(importance_df))
+
+# Gráfico de barras horizontales
+ggplot(importance_df, aes(x = Gain, y = Feature, fill = vars)) +
+  geom_col() +
+  coord_flip() +
+  labs(x = "Importance", y = "Variables", title = 'Importancia Variables Modelo XGBoost') +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    axis.text = element_text(size = 12, face = "bold", color = "black"),
+    axis.title = element_text(size = 14, face = "bold"),
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1) # Rotar los nombres de las variables en el eje x
+  ) +
+  scale_fill_manual(values = colors) +
+  guides(fill = "none")
+```
+
+## 3.3. Stacking
+
+Por último, recurrimos a una de las técnicas más utilizadas en los concursos, el *stacking*. Con nuestros modelos tuneados y las predicciones hechas, tratamos de mejorar el resultado combinando el *random forest* con el *XGBoost*.
+
+```{r}
+split_index <- createDataPartition(x_train$vector_status_group, p = 0.7, list = FALSE)
+x_train_base <- x_train[split_index, ]
+x_train_meta <- x_train[-split_index, ]
+
+# Convertir x_train_base y x_train_meta a matrices para XGBoost
+y_train_base <- vector_status_group[split_index]
+y_train_meta <- vector_status_group[-split_index]
+
+x_train_base_matrix <- x_train_base %>% select(-vector_status_group) %>%  as.matrix()
+x_train_meta_matrix <- x_train_meta %>% select(-vector_status_group) %>%  as.matrix()
+```
+```{r}
+# Ranger model
+ranger_model <- ranger(formula,
+                       data = x_train_base, num.trees = 500,
+                       mtry = 7, importance = 'impurity',
+                       min.node.size = 5, splitrule = 'gini',
+                       verbose = FALSE, seed = 42, probability = FALSE)
+
+# Predecir con el modelo Ranger
+ranger_predictions_meta <- predict(ranger_model, x_train_meta, type = "response")$predictions
+```
+```{r}
+# Xgboost model
+params <- list(max_depth = 15, eta = 0.02,
+               gamma = 0, colsample_bytree  = 0.3,
+               colsample_bylevel = 0.9, colsample_bynode  = 0.7,
+               min_child_weight = 1, subsample = 0.8,
+               objective = "multi:softmax", num_class = 3)
+
+# Convert the data to DMatrix format
+dtrain_base <- xgb.DMatrix(data = x_train_base_matrix, label = as.numeric(y_train_base) - 1)
+# train model
+xgb_model <- xgb.train(params = params, data = dtrain_base, nrounds = 600)
+
+# Predecir con el modelo XGBoost
+xgb_predictions_meta <- predict(xgb_model, x_train_meta_matrix)
+```
+Ahora, creamos el modelo con el que hacemos stacking. Elegimos la regresión lineal como segunda opción ya que el `randomForest` no ha logrado mejorar el *score*.
+```{r}
+# Crear un data.frame con las predicciones de ambos modelos
+combined_predictions_meta <- data.frame(ranger = ranger_predictions_meta, xgboost = xgb_predictions_meta)
+
+# Entrenar el modelo meta
+#meta_model <- randomForest(y ~ ., data = cbind(y = x_train_meta$vector_status_group, combined_predictions_meta), ntree = 500)
+library(nnet)
+meta_model <- multinom(y ~ ., data = cbind(y = x_train_meta$vector_status_group, combined_predictions_meta))
+```
+```{r}
+# Predecir con el modelo Ranger
+ranger_predictions_test <- predict(ranger_model, x_test, type = "response")$predictions
+
+# Predecir con el modelo XGBoost
+test_matrix <- xtest %>% as.matrix()
+xgb_predictions_test <- predict(xgb_model, test_matrix)
+```
+```{r}
+# Crear un data.frame con las predicciones de ambos modelos
+combined_predictions_test <- data.frame(ranger = ranger_predictions_test, xgboost = xgb_predictions_test)
+# Stacking of both models
+stacked_predictions <- predict(meta_model, combined_predictions_test)
+
+# Make predictions on the test dataset
+stacked_predictions <- ifelse(stacked_predictions == 0, "functional", ifelse(stacked_predictions == 1, "functional needs repair", "non functional"))
+
+# Submit predictions
+stacked_predictions <- data.table(id = test$id, status_group = stacked_predictions)
+fwrite(stacked_predictions, file = "./submissions/stacking")
+```
+Hacer stacking empeora el score del modelo *XGBoost*, obteniendo un score de `0.816`.
+
+Por tanto, nos quedamos con el que hasta el momento es el mejor modelo, el `XGBoost`.
+
+![driven data score](./submissions/scores/01.png)
