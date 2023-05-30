@@ -106,7 +106,7 @@ Los ficheros proporcionados son los siguientes:
   - *functional needs repair*
 * `test_values.csv`: fichero de prueba con el que maximizar las predicciones obtenidas con el correspondiente modelo
 
-A lo largo del notebook, comentaré las distintas pruebas que he ido haciendo en el modelo y el cómo estas afectan al score de las predicciones del set de datos test.
+A lo largo del notebook, comentaré las distintas pruebas que he ido haciendo en el modelo y el cómo estas afectan al score de las predicciones del set de datos test. Esta es la última versión de varias que he ido creando con el objetivo de mejorar paso a paso el modelo, y es por ello por lo que algunos pasos, como la eliminación de algunas variables, pueda parecer que no tengan explicación, aunque todo ha sido en pro de mejorar el *score* final del modelo de acuerdo con *drivendata*
 
 # 0. Read the Data
 
@@ -154,10 +154,10 @@ skim(train,amount_tsh,construction_year,district_code,gps_height,latitude,longit
 show_plot(inspect_num(train))
 ```
 
-1. La variable `amount_tsh` se distribuye en torno al `0`, aunque existen valores claramente atípicos que sugiere una posible transformación a tipo logarítmico o algún tipo de tratamiento de los datos. Lo mismo ocurre con `num_private` y `population`.
-2. La variable `construction_year` tiene un alto número de *NAs*, aunque no estén catalogados como tal. Podríamos imputarlos y crear una nueva variable que almacene si el dato era *NA* o no. Ocurre igual con la variable `district_code`.
-3. La variable `gps_height` tiene muchos valores en torno al 0. No sabemos si tiene sentido que las bombas están a una baja altura o no.
-4. La variable `longitude` tiene valores atípicos catalogados como 0, que posiblemente sean *NAs*
+* La variable `amount_tsh` se distribuye en torno al `0`, aunque existen valores claramente atípicos que sugiere una posible transformación a tipo logarítmico o algún tipo de tratamiento de los datos. Lo mismo ocurre con `num_private` y `population`.
+* La variable `construction_year` tiene un alto número de `NA`, aunque no estén catalogados como tal. Podríamos imputarlos y crear una nueva variable que almacene si el dato era `NA` o no. Ocurre igual con la variable `district_code`.
+* La variable `gps_height` tiene muchos valores en torno al `0`. No sabemos si tiene sentido que las bombas están a una baja altura o no.
+* La variable `longitude` tiene valores atípicos catalogados como `0`, que posiblemente sean `NA`.
 
 ```{r,eval = TRUE}
 # Occurence of NAs in each column ranked in descending order
@@ -246,7 +246,9 @@ print_duplicates <- function(data) {
 # duplicated rows
 print_duplicates(traintest)
 ```
-no tenemos valores duplicados
+no tenemos valores duplicados.
+
+ELiminamos variables que han resultado perjudiciales para el score del modelo final.
 ```{r,eval = TRUE}
 traintest <- traintest %>%
              select(-quantity_group) %>%
@@ -685,7 +687,7 @@ elevation <- 0.000045
 text_elevation <- rect_height + elevation + 0.0001
 
 # Graficar el valor de accuracy para cada valor de mtry
-ggplot(gg, aes(x = mtry, y = accuracy)) +
+suppressWarnings({ggplot(gg, aes(x = mtry, y = accuracy)) +
   geom_line(color = "#377EB8", linewidth = 1.5) +
   geom_point(color = "#377EB8", size = 3) +
   geom_rect(data = gg, aes(xmin = mtry - rect_width/2, xmax = mtry + rect_width/2, ymin = accuracy + elevation, ymax = accuracy + rect_height + elevation),
@@ -704,7 +706,7 @@ ggplot(gg, aes(x = mtry, y = accuracy)) +
     panel.grid.major = element_line(color = "lightgray", linetype = "dashed"),
     panel.grid.minor = element_blank(),
     plot.margin = unit(c(1, 1, 1, 1), "cm")
-  )
+  ) })
 ```
 
 ### 3.2.2. mtry effect in drivendata accuracy
@@ -728,7 +730,7 @@ elevation <- 0.00012
 text_elevation <- rect_height + elevation + 0.0001
 
 # Graficar el valor de accuracy para cada valor de mtry
-ggplot(df, aes(x = mtry, y = accuracy)) +
+suppressWarnings({ggplot(df, aes(x = mtry, y = accuracy)) +
   geom_line(color = "#377EB8", linewidth = 1.5) +
   geom_point(color = "#377EB8", size = 3) +
   geom_rect(data = df, aes(xmin = mtry - rect_width/2, xmax = mtry + rect_width/2, ymin = accuracy + elevation, ymax = accuracy + rect_height + elevation),
@@ -747,7 +749,7 @@ ggplot(df, aes(x = mtry, y = accuracy)) +
     panel.grid.major = element_line(color = "lightgray", linetype = "dashed"),
     panel.grid.minor = element_blank(),
     plot.margin = unit(c(1, 1, 1, 1), "cm")
-  )
+  ) })
 ```
 
 Con todo ello creamos el modelo y realizamos las predicciones.
@@ -905,7 +907,7 @@ elevation <- 0.000062
 text_elevation <- rect_height + elevation + 0.0001
 
 # Graficar el valor de accuracy para cada valor de mtry
-ggplot(pdp, aes(x = mtry, y = accuracy)) +
+suppressWarnings({ggplot(pdp, aes(x = mtry, y = accuracy)) +
   geom_line(color = "#377EB8", linewidth = 1.5) +
   geom_point(color = "#377EB8", size = 3) +
   geom_rect(data = pdp, aes(xmin = mtry - rect_width/2, xmax = mtry + rect_width/2, ymin = accuracy + elevation, ymax = accuracy + rect_height + elevation),
@@ -924,7 +926,7 @@ ggplot(pdp, aes(x = mtry, y = accuracy)) +
     panel.grid.major = element_line(color = "lightgray", linetype = "dashed"),
     panel.grid.minor = element_blank(),
     plot.margin = unit(c(1, 1, 1, 1), "cm")
-  )
+  ) })
 ```
 
 una vez tenemos las parámetros ajustados, creamos el modelo y las predicciones
