@@ -50,3 +50,6 @@ The provided files are as follows:
   * *functional needs repair*
 * `test_values.csv`: test file used to maximize the predictions obtained with the corresponding model.
 Throughout the notebook, I will comment on the different tests I have performed on the model and how they affect the score of predictions on the test dataset.
+
+
+The model created got a score of `0.6265` in drivendata
